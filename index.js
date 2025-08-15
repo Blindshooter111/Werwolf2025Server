@@ -10,13 +10,15 @@ const io = new Server(server, { cors: { origin: "*" } });
 const lobbies = {}; 
 // Struktur: { lobbyId: { players: [ {id, name} ] } }
 
+const gameState = {};
+
 io.on('connection', (socket) => {
   console.log('Ein Spieler verbunden:', socket.id);
 
 socket.on('create_lobby', (playerName, callback) => {
   const lobbyId = Math.floor(1000 + Math.random() * 9000).toString(); // 4-stellig
   lobbies[lobbyId] = { players: [] };
-lobbies[lobbyId].players.push({ id: socket.id, name: playerName, ready: false });
+lobbies[lobbyId].players.push({ id: socket.id, name: playerName, ready: false, alive: true });
 socket.join(lobbyId);
 io.to(lobbyId).emit('lobby_update', lobbies[lobbyId].players);
   console.log(`Lobby ${lobbyId} erstellt von ${playerName}`);
@@ -29,7 +31,7 @@ socket.on('join_lobby', ({ lobbyId, playerName }, callback) => {
     callback({ error: 'Lobby existiert nicht' });
     return;
   }
-  lobby.players.push({ id: socket.id, name: playerName, ready: false });
+  lobby.players.push({ id: socket.id, name: playerName, ready: false, alive: true });
   socket.join(lobbyId);
   console.log(`${playerName} ist Lobby ${lobbyId} beigetreten`);
   io.to(lobbyId).emit('lobby_update', lobby.players);
@@ -52,19 +54,42 @@ socket.on('player_ready', ({ lobbyId, ready }) => {
 const gameState = {};
 
 function getState(lobbyId) {
+  console.log(`[STATE][DEBUG][${processId}] getState called for lobby ${lobbyId}`);
+  console.log(`[STATE][DEBUG][${processId}] gameState keys before: [${Object.keys(gameState).join(',')}]`);
+  console.log(`[STATE][DEBUG][${processId}] gameState[${lobbyId}] exists: ${!!gameState[lobbyId]}`);
+  
   if (!gameState[lobbyId]) {
+    console.log(`[STATE][${processId}] Creating new game state for lobby ${lobbyId}`);
     gameState[lobbyId] = {
       phase: 'Nacht',
       lovers: [],
       actions: {},
       usedPotion: { heal: false, poison: false },
       wolfVotes: {},
+      wolfVotesByRound: {},
       wolfTimer: null,
-      nightResolved: false, // <— neu
+      nightResolved: false,
     };
+  } else {
+    console.log(`[STATE][DEBUG][${processId}] Using existing state for lobby ${lobbyId}`);
+    console.log(`[STATE][DEBUG][${processId}] Existing wolfVotesByRound: ${JSON.stringify(gameState[lobbyId].wolfVotesByRound)}`);
   }
-  if (!gameState[lobbyId].actions) gameState[lobbyId].actions = {};
-  if (!gameState[lobbyId].wolfVotes) gameState[lobbyId].wolfVotes = {};
+  
+  // Only initialize if missing, never overwrite existing data
+  if (!gameState[lobbyId].actions) {
+    console.log(`[STATE][${processId}] Initializing missing actions for lobby ${lobbyId}`);
+    gameState[lobbyId].actions = {};
+  }
+  if (!gameState[lobbyId].wolfVotes) {
+    console.log(`[STATE][${processId}] Initializing missing wolfVotes for lobby ${lobbyId}`);
+    gameState[lobbyId].wolfVotes = {};
+  }
+  if (!gameState[lobbyId].wolfVotesByRound) {
+    console.log(`[STATE][${processId}] Initializing missing wolfVotesByRound for lobby ${lobbyId}`);
+    gameState[lobbyId].wolfVotesByRound = {};
+  }
+  
+  console.log(`[STATE][DEBUG][${processId}] Returning state with wolfVotesByRound: ${JSON.stringify(gameState[lobbyId].wolfVotesByRound)}`);
   return gameState[lobbyId];
 }
 function finishNight(lobbyId) {
@@ -87,9 +112,26 @@ function finishNight(lobbyId) {
 function getLobbyAndState(lobbyId) {
   const lobby = lobbies[lobbyId];
   if (!lobby) return { lobby: null, state: null };
-  const state = getState(lobbyId);     // ⬅️ Referenz aus gameState
-  if (!lobby.state) lobby.state = state;
-  return { lobby, state };
+  
+  // Store state directly in the lobby object for better persistence
+  if (!lobby.gameState) {
+    lobby.gameState = {
+      phase: 'Nacht',
+      lovers: [],
+      actions: {},
+      usedPotion: { heal: false, poison: false },
+      wolfVotes: {},
+      wolfVotesByRound: {},
+      wolfTimer: null,
+      nightResolved: false,
+      nightRound: 0,
+    };
+  }
+  
+  // Also sync to global gameState for backward compatibility
+  gameState[lobbyId] = lobby.gameState;
+  
+  return { lobby, state: lobby.gameState };
 }
 
 
@@ -108,10 +150,10 @@ function startSeerPhase(lobbyId) {
   const { lobby, state } = getLobbyAndState(lobbyId);
   if (!lobby) return;
   state.phase = 'Nacht';
-  const seer = lobby.players.find(p => p.role === 'Seher');
+  const seer = lobby.players.find(p => p.role === 'Seher' && p.alive);
   if (seer) {
     io.to(seer.id).emit('seer_turn',
-      lobby.players.map(p => ({ id: p.id, name: p.name }))
+      lobby.players.filter(p => p.alive).map(p => ({ id: p.id, name: p.name }))
     );
   } else {
     startWolfPhase(lobbyId);
@@ -147,12 +189,12 @@ if (startingNewNight) {
 
   console.log(`[WOLF][start] lobby=${lobbyId} nightRound=${state.nightRound ?? 1} resetVotes=${startingNewNight}`);
 
-  const wolves = lobby.players.filter(p => p.role === 'Werwolf');
+  const wolves = lobby.players.filter(p => p.role === 'Werwolf' && p.alive);
   if (wolves.length === 0) return startWitchPhase(lobbyId);
 
   wolves.forEach(wolf => io.to(wolf.id).emit('wolf_vote_end'));
 
-  const choices = lobby.players.map(p => ({ id: p.id, name: p.name }));
+  const choices = lobby.players.filter(p => p.alive).map(p => ({ id: p.id, name: p.name }));
   wolves.forEach(wolf => io.to(wolf.id).emit('wolf_turn', choices));
 
   wolves.forEach(wolf =>
@@ -170,12 +212,12 @@ function finalizeWolfVotes(lobbyId) {
   const roundKey = String(state.nightRound);
   const roundVotes = (state.wolfVotesByRound && state.wolfVotesByRound[roundKey]) || {};
 
-  const wolves = lobby.players.filter(p => p.role === 'Werwolf');
+  const wolves = lobby.players.filter(p => p.role === 'Werwolf' && p.alive);
   const wolvesIds = new Set(wolves.map(w => w.id));
   const expected = wolves.length;
 
   const filteredVotes = Object.fromEntries(
-    Object.entries(roundVotes).filter(([id]) => wolvesIds.has(id))
+    Object.entries(roundVotes).filter(([id, _]) => wolvesIds.has(id))
   );
   const received = Object.keys(filteredVotes).length;
 
@@ -216,7 +258,7 @@ function startWitchPhase(lobbyId) {
   const { lobby, state } = getLobbyAndState(lobbyId);
   if (!lobby) return;
   state.phase = 'Nacht';
-  const witch = lobby.players.find(p => p.role === 'Hexe');
+  const witch = lobby.players.find(p => p.role === 'Hexe' && p.alive);
   if (!witch) {
     finishNight(lobbyId);
     return;
@@ -227,7 +269,7 @@ function startWitchPhase(lobbyId) {
     victim: victim ? victim.name : null,
     canHeal: !state.usedPotion.heal && !!victim,   // heilen nur sinnvoll wenn Opfer da
     canPoison: !state.usedPotion.poison,
-    players: lobby.players.map(p => ({ id: p.id, name: p.name })),
+    players: lobby.players.filter(p => p.alive).map(p => ({ id: p.id, name: p.name })),
   });
 }
 
@@ -240,10 +282,10 @@ function startFirstNight(lobbyId) {
   state.phase = 'Nacht';
   io.to(lobbyId).emit('phase_update', 'Nacht');
 
-  const armor = lobby.players.find(p => p.role === 'Armor');
+  const armor = lobby.players.find(p => p.role === 'Armor' && p.alive);
   if (armor) {
     io.to(armor.id).emit('choose_lovers',
-      lobby.players.map(p => ({ id: p.id, name: p.name }))
+      lobby.players.filter(p => p.alive).map(p => ({ id: p.id, name: p.name }))
     );
   } else {
     startSeerPhase(lobbyId);
@@ -276,11 +318,12 @@ socket.on('start_game', ({ lobbyId }) => {
   // Zuweisen + individuelles game_started an jeden
   lobby.players.forEach((player, index) => {
     player.role = roles[index];
+    player.alive = true; // Initialize all players as alive
     io.to(player.id).emit('game_started', { role: roles[index], lobbyId });
   });
 
   // Spielzustand robust anlegen + Phase/Nacht broadcasten + Playerliste senden
-  const state = getState(lobbyId);
+  const { state } = getLobbyAndState(lobbyId);
   state.phase = 'Nacht';
   io.to(lobbyId).emit('phase_update', 'Nacht');
   emitPlayerList(lobbyId);
@@ -317,42 +360,50 @@ socket.on('wolf_action', ({ lobbyId, targetId }) => {
 
   state.nightRound = state.nightRound ?? 1;
 
-  const wolves = lobby.players.filter(p => p.role === 'Werwolf');
+  const wolves = lobby.players.filter(p => p.role === 'Werwolf' && p.alive);
   const wolfIds = new Set(wolves.map(w => w.id));
+  
   if (!wolfIds.has(socket.id)) {
     return socket.emit('error_message', 'Nur lebende Werwölfe dürfen abstimmen.');
   }
 
-  if (targetId && !lobby.players.some(p => p.id === targetId)) {
-    return socket.emit('error_message', 'Ungültiges Ziel.');
+  if (targetId && !lobby.players.some(p => p.id === targetId && p.alive)) {
+    return socket.emit('error_message', 'Ungültiges Ziel - Spieler muss am Leben sein.');
   }
 
-  state.wolfVotesByRound = state.wolfVotesByRound || {};
+  // Ensure vote tracking structure exists
   const roundKey = String(state.nightRound);
+  if (!state.wolfVotesByRound[roundKey]) {
+    state.wolfVotesByRound[roundKey] = {};
+  }
 
-  // ✅ niemals neu zuweisen, nur initialisieren falls fehlt
-  if (!state.wolfVotesByRound[roundKey]) state.wolfVotesByRound[roundKey] = {};
+  // Record or remove vote
+  if (targetId) {
+    state.wolfVotesByRound[roundKey][socket.id] = targetId;
+  } else {
+    delete state.wolfVotesByRound[roundKey][socket.id];
+  }
+
+  // Count votes from living werewolves only
   const roundVotes = state.wolfVotesByRound[roundKey];
-
-  // Debug: Prozess und Referenz
-  if (!roundVotes.__refId) roundVotes.__refId = Math.random().toString(36).slice(2, 8);
-  console.log(`[PROC] pid=${process.pid} [WOLF] lobby=${lobbyId} round=${roundKey} ref=${roundVotes.__refId} voter=${socket.id} -> ${targetId ?? 'null'}`);
-
-  if (targetId) roundVotes[socket.id] = targetId;
-  else delete roundVotes[socket.id];
-
   const filteredVotes = Object.fromEntries(
-    Object.entries(roundVotes).filter(([id]) => wolfIds.has(id))
+    Object.entries(roundVotes).filter(([id, _]) => wolfIds.has(id))
   );
   const received = Object.keys(filteredVotes).length;
   const expected = wolves.length;
 
-  wolves.forEach(w => io.to(w.id).emit('wolf_vote_update', { expected, received }));
+  // Send real-time updates to all werewolves
+  const updateData = { expected, received };
+  wolves.forEach(w => {
+    io.to(w.id).emit('wolf_vote_update', updateData);
+  });
 
-  console.log(`[WOLF] wolves=${[...wolfIds].join(',')}`);
-  console.log(`[WOLF] votes_raw=${JSON.stringify(roundVotes)} | votes_filtered=${JSON.stringify(filteredVotes)} | ${received}/${expected}`);
+  console.log(`[WOLF] lobby=${lobbyId} round=${roundKey} votes=${received}/${expected} targets=${JSON.stringify(filteredVotes)}`);
 
-  if (received === expected) finalizeWolfVotes(lobbyId);
+  // Finalize when all votes are in
+  if (received === expected && received > 0) {
+    finalizeWolfVotes(lobbyId);
+  }
 });
 
 
@@ -384,14 +435,15 @@ socket.on('witch_done', ({ lobbyId }) => {
 function generateRoles(playerCount) {
   const roles = [];
 
-  // Immer mindestens diese Spezialrollen
+  // Always include core roles for balanced gameplay
   roles.push('Werwolf');
   if (playerCount >= 3) roles.push('Werwolf');
-  if (playerCount >= 4) roles.push('Hexe');
-  if (playerCount >= 5) roles.push('Armor');
-  if (playerCount >= 6) roles.push('Werwolf');
+  if (playerCount >= 4) roles.push('Seher');
+  if (playerCount >= 5) roles.push('Hexe');
+  if (playerCount >= 6) roles.push('Armor');
+  if (playerCount >= 7) roles.push('Werwolf');
 
-  // Rest mit Dorfbewohnern auffüllen
+  // Fill rest with villagers
   while (roles.length < playerCount) {
     roles.push('Dorfbewohner');
   }
@@ -401,11 +453,56 @@ function generateRoles(playerCount) {
 
   socket.on('disconnect', () => {
     console.log('Spieler getrennt:', socket.id);
-    // Spieler aus allen Lobbys entfernen
+    // Remove player from all lobbies and mark as not alive
     for (const lobbyId in lobbies) {
       const lobby = lobbies[lobbyId];
-      lobby.players = lobby.players.filter(p => p.id !== socket.id);
-      io.to(lobbyId).emit('lobby_update', lobby.players);
+      const playerIndex = lobby.players.findIndex(p => p.id === socket.id);
+      if (playerIndex !== -1) {
+        const player = lobby.players[playerIndex];
+        console.log(`Player ${player.name} (${socket.id}) disconnected from lobby ${lobbyId}`);
+        
+        // Mark player as not alive instead of removing to maintain game state
+        player.alive = false;
+        
+        // If this was during wolf voting, recalculate votes
+        const { state } = getLobbyAndState(lobbyId);
+        if (state && state.phase === 'Nacht' && player.role === 'Werwolf') {
+          console.log(`Werewolf ${player.name} disconnected during voting, recalculating votes...`);
+          
+          // Remove their vote if any
+          const roundKey = String(state.nightRound ?? 1);
+          if (state.wolfVotesByRound && state.wolfVotesByRound[roundKey]) {
+            delete state.wolfVotesByRound[roundKey][socket.id];
+          }
+          
+          // Recalculate and update remaining werewolves
+          const wolves = lobby.players.filter(p => p.role === 'Werwolf' && p.alive);
+          if (wolves.length > 0) {
+            const wolfIds = new Set(wolves.map(w => w.id));
+            const roundVotes = state.wolfVotesByRound[roundKey] || {};
+            const filteredVotes = Object.fromEntries(
+              Object.entries(roundVotes).filter(([id, _]) => wolfIds.has(id))
+            );
+            const received = Object.keys(filteredVotes).length;
+            const expected = wolves.length;
+            
+            // Send updated counts to remaining werewolves
+            const updateData = { expected, received };
+            wolves.forEach(w => {
+              io.to(w.id).emit('wolf_vote_update', updateData);
+            });
+            
+            console.log(`[WOLF] Updated vote count after disconnect: ${received}/${expected}`);
+            
+            // Check if voting can now complete
+            if (received === expected && received > 0) {
+              finalizeWolfVotes(lobbyId);
+            }
+          }
+        }
+        
+        io.to(lobbyId).emit('lobby_update', lobby.players);
+      }
     }
   });
 });
