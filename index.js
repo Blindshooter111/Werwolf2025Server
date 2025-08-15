@@ -97,16 +97,60 @@ function finishNight(lobbyId) {
   if (!lobby) return;
   if (state.nightResolved) return;   // <— Schutz
   state.nightResolved = true;
-  // ... dein existierender Code (deaths, lovers, unique, remove, emits) ...
+  
+  // Process night deaths (wolf kill, poison, etc.)
+  const deaths = [];
+  
+  // Wolf target (if not healed)
+  if (state.actions.wolfTarget && !state.actions.healTarget) {
+    const victim = lobby.players.find(p => p.id === state.actions.wolfTarget);
+    if (victim && victim.alive) {
+      victim.alive = false;
+      deaths.push(victim.name);
+    }
+  }
+  
+  // Poison target
+  if (state.actions.poisonTarget) {
+    const victim = lobby.players.find(p => p.id === state.actions.poisonTarget);
+    if (victim && victim.alive) {
+      victim.alive = false;
+      deaths.push(victim.name);
+    }
+  }
+  
+  // Handle lover deaths if one lover dies
+  if (state.lovers && state.lovers.length === 2) {
+    const lover1 = lobby.players.find(p => p.id === state.lovers[0]);
+    const lover2 = lobby.players.find(p => p.id === state.lovers[1]);
+    
+    if (lover1 && lover2) {
+      if (!lover1.alive && lover2.alive) {
+        lover2.alive = false;
+        deaths.push(`${lover2.name} (Liebeskummer)`);
+      } else if (!lover2.alive && lover1.alive) {
+        lover1.alive = false;
+        deaths.push(`${lover1.name} (Liebeskummer)`);
+      }
+    }
+  }
+  
+  // Announce deaths
+  if (deaths.length > 0) {
+    io.to(lobbyId).emit('night_deaths', deaths);
+  } else {
+    io.to(lobbyId).emit('night_deaths', ['Niemand ist gestorben.']);
+  }
 
   // Reset für nächste Nacht/Tag
   state.actions = {};
   state.wolfVotes = {};
   if (state.wolfTimer) { clearTimeout(state.wolfTimer); state.wolfTimer = null; }
 
-  state.phase = 'Tag';
-  io.to(lobbyId).emit('phase_update', 'Tag');
   emitPlayerList(lobbyId);
+  
+  // Start day phase
+  startDayPhase(lobbyId);
 }
 
 function getLobbyAndState(lobbyId) {
@@ -125,6 +169,8 @@ function getLobbyAndState(lobbyId) {
       wolfTimer: null,
       nightResolved: false,
       nightRound: 0,
+      dayVotes: {},
+      dayVotingActive: false,
     };
   }
   
@@ -273,6 +319,127 @@ function startWitchPhase(lobbyId) {
   });
 }
 
+function startDayPhase(lobbyId) {
+  const { lobby, state } = getLobbyAndState(lobbyId);
+  if (!lobby) return;
+  
+  state.phase = 'Tag';
+  state.dayVotes = {};
+  state.dayVotingActive = true;
+  
+  console.log(`[DAY][start] lobby=${lobbyId} starting day phase`);
+  
+  io.to(lobbyId).emit('phase_update', 'Tag');
+  
+  // Get all living players who can vote
+  const livingPlayers = lobby.players.filter(p => p.alive);
+  
+  if (livingPlayers.length <= 2) {
+    // Game should end if too few players
+    io.to(lobbyId).emit('game_end', 'Spiel beendet - zu wenige Spieler übrig');
+    return;
+  }
+  
+  // Send voting options to all living players
+  const votingOptions = livingPlayers.map(p => ({ id: p.id, name: p.name }));
+  
+  livingPlayers.forEach(player => {
+    io.to(player.id).emit('day_vote_start', {
+      players: votingOptions,
+      canVote: true
+    });
+  });
+  
+  // Also inform dead players (they can observe but not vote)
+  const deadPlayers = lobby.players.filter(p => !p.alive);
+  deadPlayers.forEach(player => {
+    io.to(player.id).emit('day_vote_start', {
+      players: votingOptions,
+      canVote: false
+    });
+  });
+  
+  console.log(`[DAY] Voting started with ${livingPlayers.length} living players`);
+}
+
+function finalizeDayVotes(lobbyId) {
+  const { lobby, state } = getLobbyAndState(lobbyId);
+  if (!lobby) return;
+  
+  const livingPlayers = lobby.players.filter(p => p.alive);
+  const expected = livingPlayers.length;
+  const received = Object.keys(state.dayVotes).length;
+  
+  console.log(`[DAY][finalize] lobby=${lobbyId} expected=${expected} received=${received} votes=${JSON.stringify(state.dayVotes)}`);
+  
+  if (received < expected) {
+    console.log('[DAY][finalize] noch nicht vollständig – Abbruch');
+    return;
+  }
+  
+  // Count votes
+  const voteCounts = {};
+  Object.values(state.dayVotes).forEach(targetId => {
+    if (targetId) {  // null votes are abstentions
+      voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
+    }
+  });
+  
+  console.log(`[DAY][finalize] vote counts=${JSON.stringify(voteCounts)}`);
+  
+  // Find player(s) with most votes
+  let maxVotes = 0;
+  let topCandidates = [];
+  
+  Object.entries(voteCounts).forEach(([playerId, count]) => {
+    if (count > maxVotes) {
+      maxVotes = count;
+      topCandidates = [playerId];
+    } else if (count === maxVotes) {
+      topCandidates.push(playerId);
+    }
+  });
+  
+  let lynchTarget = null;
+  let resultMessage = '';
+  
+  // Handle tie or no votes
+  if (maxVotes === 0) {
+    resultMessage = 'Niemand wurde gelyncht - keine Stimmen abgegeben.';
+  } else if (topCandidates.length > 1) {
+    // Tie - no lynch according to rule
+    resultMessage = 'Unentschieden - niemand wird gelyncht.';
+  } else {
+    // Clear winner
+    lynchTarget = topCandidates[0];
+    const victim = lobby.players.find(p => p.id === lynchTarget);
+    if (victim) {
+      victim.alive = false;
+      resultMessage = `${victim.name} wurde gelyncht.`;
+    }
+  }
+  
+  state.dayVotingActive = false;
+  
+  // Send results to all players
+  io.to(lobbyId).emit('day_vote_result', {
+    result: resultMessage,
+    lynchTarget: lynchTarget,
+    votes: voteCounts
+  });
+  
+  emitPlayerList(lobbyId);
+  
+  console.log(`[DAY][finalize] result: ${resultMessage}`);
+  
+  // TODO: Add win condition checks here
+  
+  // Start next night after a delay
+  setTimeout(() => {
+    startFirstNight(lobbyId);
+  }, 3000);
+}
+
 
 
 function startFirstNight(lobbyId) {
@@ -415,7 +582,7 @@ socket.on('witch_heal', ({ lobbyId }) => {
   const { state } = getLobbyAndState(lobbyId);
   if (!state) return;
   if (state.usedPotion.heal) return;
-  state.actions.wolfTarget = null; // Opfer gerettet
+  state.actions.healTarget = state.actions.wolfTarget; // Mark as healed
   state.usedPotion.heal = true;
 });
 
@@ -429,6 +596,48 @@ socket.on('witch_poison', ({ lobbyId, targetId }) => {
 
 socket.on('witch_done', ({ lobbyId }) => {
   finishNight(lobbyId);
+});
+
+// Day phase voting
+socket.on('day_vote', ({ lobbyId, targetId }) => {
+  const { lobby, state } = getLobbyAndState(lobbyId);
+  if (!lobby) return;
+  if (state.phase !== 'Tag' || !state.dayVotingActive) return;
+  
+  const voter = lobby.players.find(p => p.id === socket.id);
+  if (!voter || !voter.alive) {
+    return socket.emit('error_message', 'Nur lebende Spieler dürfen abstimmen.');
+  }
+  
+  // Validate target (must be alive or null for abstention)
+  if (targetId && !lobby.players.some(p => p.id === targetId && p.alive)) {
+    return socket.emit('error_message', 'Ungültiges Ziel - Spieler muss am Leben sein.');
+  }
+  
+  // Record or remove vote
+  if (targetId) {
+    state.dayVotes[socket.id] = targetId;
+  } else {
+    // Allow abstention by setting to null
+    state.dayVotes[socket.id] = null;
+  }
+  
+  const livingPlayers = lobby.players.filter(p => p.alive);
+  const received = Object.keys(state.dayVotes).length;
+  const expected = livingPlayers.length;
+  
+  // Send real-time updates to all living players
+  const updateData = { expected, received };
+  livingPlayers.forEach(player => {
+    io.to(player.id).emit('day_vote_update', updateData);
+  });
+  
+  console.log(`[DAY] lobby=${lobbyId} votes=${received}/${expected} votes=${JSON.stringify(state.dayVotes)}`);
+  
+  // Finalize when all votes are in
+  if (received === expected && received > 0) {
+    finalizeDayVotes(lobbyId);
+  }
 });
 
 
