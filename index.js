@@ -149,6 +149,27 @@ function finishNight(lobbyId) {
 
   emitPlayerList(lobbyId);
   
+  // Check win conditions after night deaths
+  const livingPlayers = lobby.players.filter(p => p.alive);
+  const livingWolves = livingPlayers.filter(p => p.role === 'Werwolf');
+  const livingVillagers = livingPlayers.filter(p => p.role !== 'Werwolf');
+  
+  if (livingWolves.length === 0) {
+    io.to(lobbyId).emit('game_end', {
+      message: 'Die Dorfbewohner haben gewonnen! Alle Werwölfe wurden eliminiert.',
+      winners: 'Dorfbewohner'
+    });
+    console.log(`[GAME][END] Villagers won after night`);
+    return;
+  } else if (livingWolves.length >= livingVillagers.length) {
+    io.to(lobbyId).emit('game_end', {
+      message: 'Die Werwölfe haben gewonnen! Sie sind in der Überzahl.',
+      winners: 'Werwölfe'
+    });
+    console.log(`[GAME][END] Werewolves won after night`);
+    return;
+  }
+  
   // Start day phase
   startDayPhase(lobbyId);
 }
@@ -432,7 +453,30 @@ function finalizeDayVotes(lobbyId) {
   
   console.log(`[DAY][finalize] result: ${resultMessage}`);
   
-  // TODO: Add win condition checks here
+  // Check win conditions
+  const alivePlayers = lobby.players.filter(p => p.alive);
+  const livingWolves = alivePlayers.filter(p => p.role === 'Werwolf');
+  const livingVillagers = alivePlayers.filter(p => p.role !== 'Werwolf');
+  
+  let gameEnd = false;
+  let winMessage = '';
+  
+  if (livingWolves.length === 0) {
+    gameEnd = true;
+    winMessage = 'Die Dorfbewohner haben gewonnen! Alle Werwölfe wurden eliminiert.';
+  } else if (livingWolves.length >= livingVillagers.length) {
+    gameEnd = true;
+    winMessage = 'Die Werwölfe haben gewonnen! Sie sind in der Überzahl.';
+  }
+  
+  if (gameEnd) {
+    io.to(lobbyId).emit('game_end', {
+      message: winMessage,
+      winners: gameEnd ? (livingWolves.length === 0 ? 'Dorfbewohner' : 'Werwölfe') : null
+    });
+    console.log(`[GAME][END] ${winMessage}`);
+    return;
+  }
   
   // Start next night after a delay
   setTimeout(() => {
@@ -706,6 +750,36 @@ function generateRoles(playerCount) {
             // Check if voting can now complete
             if (received === expected && received > 0) {
               finalizeWolfVotes(lobbyId);
+            }
+          }
+        }
+        
+        // If this was during day voting, recalculate votes
+        if (state && state.phase === 'Tag' && state.dayVotingActive) {
+          console.log(`Player ${player.name} disconnected during day voting, recalculating votes...`);
+          
+          // Remove their vote if any
+          if (state.dayVotes && state.dayVotes[socket.id]) {
+            delete state.dayVotes[socket.id];
+          }
+          
+          // Recalculate and update remaining players
+          const livingPlayers = lobby.players.filter(p => p.alive);
+          if (livingPlayers.length > 0) {
+            const received = Object.keys(state.dayVotes).length;
+            const expected = livingPlayers.length;
+            
+            // Send updated counts to remaining living players
+            const updateData = { expected, received };
+            livingPlayers.forEach(p => {
+              io.to(p.id).emit('day_vote_update', updateData);
+            });
+            
+            console.log(`[DAY] Updated vote count after disconnect: ${received}/${expected}`);
+            
+            // Check if voting can now complete
+            if (received === expected && received > 0) {
+              finalizeDayVotes(lobbyId);
             }
           }
         }
