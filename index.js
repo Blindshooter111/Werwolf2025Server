@@ -223,7 +223,10 @@ function startSeerPhase(lobbyId) {
       lobby.players.filter(p => p.alive).map(p => ({ id: p.id, name: p.name }))
     );
   } else {
-    startWolfPhase(lobbyId);
+    // Kleine Pause vor Werwolfphase wenn kein Seher vorhanden
+    setTimeout(() => {
+      startWolfPhase(lobbyId);
+    }, 2000);
   }
 }
 
@@ -257,7 +260,13 @@ if (startingNewNight) {
   console.log(`[WOLF][start] lobby=${lobbyId} nightRound=${state.nightRound ?? 1} resetVotes=${startingNewNight}`);
 
   const wolves = lobby.players.filter(p => p.role === 'Werwolf' && p.alive);
-  if (wolves.length === 0) return startWitchPhase(lobbyId);
+  if (wolves.length === 0) {
+    // Kleine Pause vor Hexenphase wenn keine Werwölfe vorhanden
+    setTimeout(() => {
+      startWitchPhase(lobbyId);
+    }, 2000);
+    return;
+  }
 
   wolves.forEach(wolf => io.to(wolf.id).emit('wolf_vote_end'));
 
@@ -314,7 +323,10 @@ function finalizeWolfVotes(lobbyId) {
   state.actions.wolfTarget = topTarget;
 
   console.log(`[WOLF][finalize] victim=${topTarget} → Hexenphase`);
-  startWitchPhase(lobbyId);
+  // Kleine Pause vor Hexenphase
+  setTimeout(() => {
+    startWitchPhase(lobbyId);
+  }, 2000);
 }
 
 
@@ -499,7 +511,10 @@ function startFirstNight(lobbyId) {
       lobby.players.filter(p => p.alive).map(p => ({ id: p.id, name: p.name }))
     );
   } else {
-    startSeerPhase(lobbyId);
+    // Kleine Pause vor Seherphase wenn kein Armor vorhanden
+    setTimeout(() => {
+      startSeerPhase(lobbyId);
+    }, 2000);
   }
 }
 
@@ -551,7 +566,10 @@ socket.on('set_lovers', ({ lobbyId, lover1, lover2 }) => {
   if (!lobby) return;
   state.lovers = [lover1, lover2];
   io.to(lobbyId).emit('lovers_set', state.lovers);
-  startSeerPhase(lobbyId);
+  // Kleine Pause vor Seherphase
+  setTimeout(() => {
+    startSeerPhase(lobbyId);
+  }, 2000);
 });
 
 // Seher
@@ -561,7 +579,10 @@ socket.on('seer_action', ({ lobbyId, targetId }) => {
   if (state.phase !== 'Nacht') return;
   const target = lobby.players.find(p => p.id === targetId);
   if (target) socket.emit('seer_result', { name: target.name, role: target.role });
-  startWolfPhase(lobbyId);
+  // Kleine Pause vor Werwolfphase
+  setTimeout(() => {
+    startWolfPhase(lobbyId);
+  }, 2000);
 });
 
 socket.on('wolf_action', ({ lobbyId, targetId }) => {
