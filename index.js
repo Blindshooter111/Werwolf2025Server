@@ -393,6 +393,7 @@ function startDayPhase(lobbyId) {
   });
   
   console.log(`[DAY] Voting started with ${livingPlayers.length} living players`);
+  console.log(`[DAY] Voting options: ${votingOptions.map(p => p.name).join(', ')}`);
 }
 
 function finalizeDayVotes(lobbyId) {
@@ -701,6 +702,7 @@ socket.on('day_vote', ({ lobbyId, targetId }) => {
   
   // Finalize when all votes are in
   if (received === expected && received > 0) {
+    console.log(`[DAY] All votes received, finalizing day voting for lobby ${lobbyId}`);
     finalizeDayVotes(lobbyId);
   }
 });
